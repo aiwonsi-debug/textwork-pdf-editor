@@ -13,3 +13,4 @@
 - [x] Expose font-resource and nested Form XObject inspection metadata for every PDF page.
 - [x] Show a visible per-edit verification report for every queued edit in the browser workspace.
 - [x] Add test coverage for all-safe versus blocked output handling and structured edit result reporting.
+- [ ] Export the completed Textwork source to a private GitHub repository and verify the pushed commit.
