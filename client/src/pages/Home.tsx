@@ -66,6 +66,14 @@ type Result = {
   positionAdjusted?: boolean;
 };
 
+type EditResponse = {
+  success: boolean;
+  results: Result[];
+  outputUrl?: string;
+  outputKey?: string;
+  error?: string;
+};
+
 const MAX_FILE_SIZE = 18 * 1024 * 1024;
 
 function formatBytes(size: number) {
@@ -92,11 +100,13 @@ export default function Home() {
   const [uploading, setUploading] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [previewToken, setPreviewToken] = useState(0);
+  const [previewSourceKey, setPreviewSourceKey] = useState<string | null>(null);
   const [outputUrl, setOutputUrl] = useState<string | null>(null);
   const [results, setResults] = useState<Result[]>([]);
+  const [dragActive, setDragActive] = useState(false);
 
   const page = pdf?.pages[selectedPage];
-  const previewUrl = pdf ? `/api/pdf/render?sourceKey=${encodeURIComponent(pdf.sourceKey)}&page=${selectedPage}&v=${previewToken}` : "";
+  const previewUrl = pdf ? `/api/pdf/render?sourceKey=${encodeURIComponent(previewSourceKey ?? pdf.sourceKey)}&page=${selectedPage}&v=${previewToken}` : "";
   const selectedKey = selectedHit ? `${selectedPage}:${selectedHit.id}` : "";
   const currentPending = pendingEdits.find(edit => edit.id === selectedKey);
   const isSameLength = selectedHit ? codePointLength(selectedHit.text) === codePointLength(replacement) : false;
@@ -107,7 +117,51 @@ export default function Home() {
     [pendingEdits, selectedPage],
   );
 
+  function clearSelection() {
+    setSelectedHit(null);
+    setReplacement("");
+    setDx(0);
+    setDy(0);
+  }
+
+  function navigateToPage(nextPage: number) {
+    setSelectedPage(nextPage);
+    clearSelection();
+    setOutputUrl(null);
+    setPreviewSourceKey(pdf?.sourceKey ?? null);
+    setResults([]);
+  }
+
+  function invalidateGeneratedOutput() {
+    setOutputUrl(null);
+    setPreviewSourceKey(pdf?.sourceKey ?? null);
+    setResults([]);
+  }
+
+  function handleReplacementChange(value: string) {
+    setReplacement(value);
+    invalidateGeneratedOutput();
+  }
+
+  function handlePositionChange(axis: "x" | "y", value: string) {
+    const nextValue = Number(value) || 0;
+    if (axis === "x") setDx(nextValue);
+    else setDy(nextValue);
+    invalidateGeneratedOutput();
+  }
+
+  async function readJsonResponse<T>(response: Response): Promise<T> {
+    const body = await response.text();
+    if (!body) throw new Error(response.ok ? "The PDF service returned an empty response." : "The PDF service is unavailable. Please try again.");
+    try {
+      return JSON.parse(body) as T;
+    } catch {
+      throw new Error(response.ok ? "The PDF service returned an unexpected response." : "The PDF service is unavailable. Please try again.");
+    }
+  }
+
   async function inspectFile(file: File) {
+    setDragActive(false);
     if (!(file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"))) {
       toast.error("Choose a PDF file.");
       return;
@@ -119,16 +173,18 @@ export default function Home() {
     setUploading(true);
     setPdf(null);
     setPendingEdits([]);
-    setSelectedHit(null);
+    clearSelection();
     setResults([]);
     setOutputUrl(null);
+    setPreviewSourceKey(null);
     try {
       const body = new FormData();
       body.append("file", file);
       const response = await fetch("/api/pdf/inspect", { method: "POST", body });
-      const payload = await response.json();
+      const payload = await readJsonResponse<PdfDocument & { error?: string }>(response);
       if (!response.ok) throw new Error(payload.error || "The PDF could not be inspected.");
       setPdf(payload);
+      setPreviewSourceKey(payload.sourceKey);
       setSelectedPage(0);
       toast.success("PDF ready. Select a highlighted text item to begin.");
     } catch (error) {
@@ -145,7 +201,7 @@ export default function Home() {
     setReplacement(existing?.newText ?? hit.text);
     setDx(existing?.dx ?? 0);
     setDy(existing?.dy ?? 0);
-    setResults([]);
+    invalidateGeneratedOutput();
   }
 
   function queueEdit() {
@@ -168,7 +224,7 @@ export default function Home() {
       dy,
     };
     setPendingEdits(edits => [...edits.filter(item => item.id !== edit.id), edit]);
-    setOutputUrl(null);
+    invalidateGeneratedOutput();
     toast.success("Edit queued for native-font verification at save time.");
   }
 
@@ -179,7 +235,7 @@ export default function Home() {
       setDx(0);
       setDy(0);
     }
-    setOutputUrl(null);
+    invalidateGeneratedOutput();
   }
 
   async function generatePdf() {
@@ -196,13 +252,15 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sourceKey: pdf.sourceKey, fileName: pdf.fileName, edits: pendingEdits }),
       });
-      const payload = await response.json();
+      const payload = await readJsonResponse<EditResponse>(response);
       setResults(payload.results || []);
       if (!response.ok || !payload.success || !payload.outputUrl) {
-        toast.error("No new PDF was generated. Review the exact safety result below.");
+        setPreviewSourceKey(pdf.sourceKey);
+        toast.error(payload.error || "No new PDF was generated. Review the exact safety result below.");
         return;
       }
       setOutputUrl(payload.outputUrl);
+      setPreviewSourceKey(payload.outputKey || pdf.sourceKey);
       setPreviewToken(token => token + 1);
       toast.success("All edits were verified. Your new PDF is ready for download.");
     } catch (error) {
@@ -219,6 +277,7 @@ export default function Home() {
 
   function dropFile(event: DragEvent<HTMLButtonElement>) {
     event.preventDefault();
+    setDragActive(false);
     const file = event.dataTransfer.files?.[0];
     if (file) void inspectFile(file);
   }
@@ -226,6 +285,7 @@ export default function Home() {
   function moveSelection(horizontal: number, vertical: number) {
     setDx(value => Number((value + horizontal).toFixed(1)));
     setDy(value => Number((value + vertical).toFixed(1)));
+    invalidateGeneratedOutput();
   }
 
   return (
@@ -240,11 +300,12 @@ export default function Home() {
         </div>
         <div className="header-assurance">
           <div className="assurance-chip"><LockKeyhole size={13} /> Original stays untouched</div>
-          <Button className="open-file-button" onClick={() => inputRef.current?.click()} disabled={uploading}>
-            {uploading ? <LoaderCircle className="animate-spin" /> : <Upload />}
-            {pdf ? "Replace PDF" : "Open PDF"}
+          <Button className="open-file-button" onClick={() => inputRef.current?.click()} disabled={uploading || processing}>
+            {uploading || processing ? <LoaderCircle className="animate-spin" /> : <Upload />}
+            {processing ? "Working…" : pdf ? "Replace PDF" : "Open PDF"}
           </Button>
           <input ref={inputRef} className="sr-only" type="file" accept="application/pdf,.pdf" onChange={changeFile} />
+          <span className="sr-only" aria-live="polite">{uploading ? "Inspecting PDF" : processing ? "Verifying edits" : outputUrl ? "Edited PDF ready for download" : ""}</span>
         </div>
       </header>
 
@@ -259,9 +320,9 @@ export default function Home() {
               <div><ScanText /><span><b>Selectable text</b> Click detected words in a rendered page workspace.</span></div>
             </div>
           </section>
-          <button className="drop-panel" onClick={() => inputRef.current?.click()} onDragOver={event => event.preventDefault()} onDrop={dropFile} disabled={uploading}>
+          <button className={cn("drop-panel", dragActive && "drop-panel--active")} onClick={() => inputRef.current?.click()} onDragOver={event => { event.preventDefault(); setDragActive(true); }} onDragLeave={() => setDragActive(false)} onDrop={dropFile} disabled={uploading || processing}>
             <div className="drop-icon">{uploading ? <LoaderCircle className="animate-spin" /> : <Upload />}</div>
-            <strong>{uploading ? "Inspecting your document…" : "Open a PDF to begin"}</strong>
+            <strong>{uploading ? "Inspecting your document…" : dragActive ? "Release to inspect PDF" : "Open a PDF to begin"}</strong>
             <span>Drop a file here, or browse your computer</span>
             <small>PDF only · up to 18 MB · original never overwritten</small>
           </button>
@@ -276,7 +337,7 @@ export default function Home() {
             <div className="rail-heading"><span>Pages</span><b>{pdf.pageCount}</b></div>
             <div className="page-list">
               {pdf.pages.map(item => (
-                <button key={item.number} className={cn("page-tab", item.number === selectedPage && "page-tab--active")} onClick={() => { setSelectedPage(item.number); setSelectedHit(null); }}>
+                <button key={item.number} className={cn("page-tab", item.number === selectedPage && "page-tab--active")} onClick={() => navigateToPage(item.number)} disabled={processing} aria-current={item.number === selectedPage ? "page" : undefined}>
                   <span className="page-mini"><FileText size={16} /><i>{item.number + 1}</i></span>
                   <span>Page {item.number + 1}</span>
                   {pendingEdits.some(edit => edit.page === item.number) && <em>{pendingEdits.filter(edit => edit.page === item.number).length}</em>}
@@ -289,10 +350,10 @@ export default function Home() {
           <section className="canvas-region">
             <div className="document-bar">
               <div className="document-title"><FileText /><div><b>{pdf.fileName}</b><span>{pdf.pageCount} pages · secure session</span></div></div>
-              <div className="page-switcher"><Button variant="ghost" size="icon" aria-label="Previous page" disabled={selectedPage === 0} onClick={() => setSelectedPage(pageNumber => pageNumber - 1)}><ChevronLeft /></Button><span>{selectedPage + 1} / {pdf.pageCount}</span><Button variant="ghost" size="icon" aria-label="Next page" disabled={selectedPage === pdf.pageCount - 1} onClick={() => setSelectedPage(pageNumber => pageNumber + 1)}><ChevronRight /></Button></div>
+              <div className="page-switcher"><Button variant="ghost" size="icon" aria-label="Previous page" disabled={processing || selectedPage === 0} onClick={() => navigateToPage(selectedPage - 1)}><ChevronLeft /></Button><span>{selectedPage + 1} / {pdf.pageCount}</span><Button variant="ghost" size="icon" aria-label="Next page" disabled={processing || selectedPage === pdf.pageCount - 1} onClick={() => navigateToPage(selectedPage + 1)}><ChevronRight /></Button></div>
             </div>
             <div className="viewer-scroll">
-              <div className="viewer-hint"><ScanText size={15} /> Click a subtle text boundary to select an original word <span>·</span> {page?.native.nestedFormCount ? `${page.native.nestedFormCount} nested form objects inspected` : "direct text stream"}</div>
+              <div className="viewer-hint"><ScanText size={15} /> {page?.textHits.length ? "Click a subtle text boundary to select an original word" : "No selectable text detected on this page"} <span>·</span> {page?.native.nestedFormCount ? `${page.native.nestedFormCount} nested form objects inspected` : "direct text stream"}</div>
               <div className="paper-frame">
                 {page && <div className="page-stage" style={{ aspectRatio: `${page.width} / ${page.height}` }}>
                   <img src={previewUrl} alt={`PDF page ${selectedPage + 1}`} />
@@ -301,9 +362,10 @@ export default function Home() {
                       const [x0, y0, x1, y1] = hit.bbox;
                       const isSelected = selectedHit?.id === hit.id;
                       const isEdited = currentPageEdits.some(edit => edit.id === `${selectedPage}:${hit.id}`);
-                      return <button key={hit.id} className={cn("text-hit", isSelected && "text-hit--selected", isEdited && "text-hit--edited")} style={{ left: `${(x0 / page.width) * 100}%`, top: `${(y0 / page.height) * 100}%`, width: `${((x1 - x0) / page.width) * 100}%`, height: `${((y1 - y0) / page.height) * 100}%` }} onClick={() => chooseHit(hit)} aria-label={`Select text: ${hit.text}`}><span>{hit.text}</span></button>;
+                      return <button key={hit.id} className={cn("text-hit", isSelected && "text-hit--selected", isEdited && "text-hit--edited")} style={{ left: `${(x0 / page.width) * 100}%`, top: `${(y0 / page.height) * 100}%`, width: `${((x1 - x0) / page.width) * 100}%`, height: `${((y1 - y0) / page.height) * 100}%` }} onClick={() => chooseHit(hit)} aria-label={`Select text: ${hit.text}`} aria-pressed={isSelected} disabled={processing}><span>{hit.text}</span></button>;
                     })}
                   </div>
+                  {page.textHits.length === 0 && <div className="no-text-state" role="status"><ScanText size={20} /><strong>No selectable text on this page</strong><span>It may be scanned, outlined, or encoded in an unsupported way.</span></div>}
                 </div>}
               </div>
             </div>
@@ -318,18 +380,18 @@ export default function Home() {
                 <div className="field-label">Original text <span>native</span></div>
                 <div className="source-text">{selectedHit.text}</div>
                 <label className="field-label" htmlFor="replacement">Replacement text <span>{codePointLength(replacement)}/{codePointLength(selectedHit.text)} chars</span></label>
-                <Input id="replacement" value={replacement} onChange={event => setReplacement(event.target.value)} className="replacement-input" autoComplete="off" />
+                <Input id="replacement" value={replacement} onChange={event => handleReplacementChange(event.target.value)} className="replacement-input" autoComplete="off" disabled={processing} />
                 <div className={cn("safety-readout", isSameLength ? "safety-readout--ready" : "safety-readout--blocked")}>
                   {isSameLength ? <Check size={16} /> : <AlertTriangle size={16} />}
                   <span>{isSameLength ? "Same-length candidate. Font and object safety will be verified at save time." : "Length changes need reflow. This version will not apply them."}</span>
                 </div>
                 <div className="position-block">
                   <div className="field-label"><Move size={14} /> Position adjustment <span>PDF points</span></div>
-                  <div className="nudge-grid"><Button variant="outline" size="icon" aria-label="Move text up" onClick={() => moveSelection(0, 2)}>↑</Button><Button variant="outline" size="icon" aria-label="Move text left" onClick={() => moveSelection(-2, 0)}>←</Button><Button variant="outline" size="icon" aria-label="Move text right" onClick={() => moveSelection(2, 0)}>→</Button><Button variant="outline" size="icon" aria-label="Move text down" onClick={() => moveSelection(0, -2)}>↓</Button></div>
-                  <div className="coordinate-row"><label>X <Input type="number" step="0.5" value={dx} onChange={event => setDx(Number(event.target.value) || 0)} /></label><label>Y <Input type="number" step="0.5" value={dy} onChange={event => setDy(Number(event.target.value) || 0)} /></label><Button variant="ghost" size="icon" aria-label="Reset position" onClick={() => { setDx(0); setDy(0); }}><RotateCcw size={16} /></Button></div>
+                  <div className="nudge-grid"><Button variant="outline" size="icon" aria-label="Move text up" onClick={() => moveSelection(0, 2)} disabled={processing}>↑</Button><Button variant="outline" size="icon" aria-label="Move text left" onClick={() => moveSelection(-2, 0)} disabled={processing}>←</Button><Button variant="outline" size="icon" aria-label="Move text right" onClick={() => moveSelection(2, 0)} disabled={processing}>→</Button><Button variant="outline" size="icon" aria-label="Move text down" onClick={() => moveSelection(0, -2)} disabled={processing}>↓</Button></div>
+                  <div className="coordinate-row"><label>X <Input type="number" step="0.5" value={dx} onChange={event => handlePositionChange("x", event.target.value)} disabled={processing} /></label><label>Y <Input type="number" step="0.5" value={dy} onChange={event => handlePositionChange("y", event.target.value)} disabled={processing} /></label><Button variant="ghost" size="icon" aria-label="Reset position" onClick={() => { setDx(0); setDy(0); invalidateGeneratedOutput(); }} disabled={processing}><RotateCcw size={16} /></Button></div>
                 </div>
-                <Button className="queue-button" onClick={queueEdit} disabled={!isSameLength || replacement.trim() === selectedHit.text}><Plus /> {currentPending ? "Update safe edit" : "Queue safe edit"}</Button>
-                {currentPending && <button className="remove-current" onClick={() => removeEdit(currentPending.id)}><X size={14} /> Remove this edit</button>}
+                <Button className="queue-button" onClick={queueEdit} disabled={processing || !isSameLength || replacement.trim() === selectedHit.text}><Plus /> {currentPending ? "Update safe edit" : "Queue safe edit"}</Button>
+                {currentPending && <button className="remove-current" onClick={() => removeEdit(currentPending.id)} disabled={processing}><X size={14} /> Remove this edit</button>}
                 {activeResult && <div className={cn("result-callout", activeResult.success ? "result-callout--success" : "result-callout--warning")}><div>{activeResult.success ? <Check size={16} /> : <AlertTriangle size={16} />}</div><p><b>{activeResult.success ? "Verified" : "Not applied"}</b>{activeResult.message}</p></div>}
               </div>
             )}
